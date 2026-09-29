@@ -1,0 +1,779 @@
+#!/bin/bash
+#Script Variables
+HOST='206.72.205.68';
+USER='noonvipv_aspanel';
+PASS='cqIBVsZC@5';
+DBNAME='noonvipv_aspanel';
+SYSTEMKEY='xxxNoonxxx';
+OBFS='noondev';
+HYSTERIA_TYPE='default';
+#!/usr/bin/env bash
+# ============================================================================
+# NoonDev 2026 compatibility layer
+# Supported: Debian 12/13; Ubuntu 22.04/24.04/26.04 LTS (amd64)
+# Keeps the original developer service/port flow, but repairs modern OS issues.
+# ============================================================================
+NOONDEV_BASE_URL="https://noonvipvpn.xyz/github/noondev-main"
+NOONDEV_LOG="/var/log/noondev-installer.log"
+mkdir -p /var/log
+: >"$NOONDEV_LOG" 2>/dev/null || true
+chmod 600 "$NOONDEV_LOG" 2>/dev/null || true
+
+noon_log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$NOONDEV_LOG"
+}
+
+noon_wait_apt() {
+    local i
+    for i in $(seq 1 120); do
+        if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    noon_log "ERROR: apt/dpkg lock did not clear within 240 seconds"
+    return 1
+}
+
+noon_dns_ok() {
+    getent ahostsv4 deb.debian.org >/dev/null 2>&1 || getent ahostsv4 archive.ubuntu.com >/dev/null 2>&1
+}
+
+noon_fix_dns() {
+    noon_dns_ok && return 0
+    noon_log "DNS lookup failed; applying a safe resolver fallback"
+    if systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat >/etc/systemd/resolved.conf.d/99-noondev.conf <<'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=9.9.9.9
+EOF
+        systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        if [ -e /run/systemd/resolve/resolv.conf ]; then
+            ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || true
+        fi
+    elif [ ! -L /etc/resolv.conf ]; then
+        cp -a /etc/resolv.conf /etc/resolv.conf.noondev-backup 2>/dev/null || true
+        cat >/etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+    fi
+    noon_dns_ok
+}
+
+noon_repair_sources() {
+    . /etc/os-release
+    local stamp backup codename
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    backup="/root/noondev-apt-backup-$stamp"
+    mkdir -p "$backup/sources.list.d"
+    cp -a /etc/apt/sources.list "$backup/" 2>/dev/null || true
+    cp -a /etc/apt/sources.list.d/. "$backup/sources.list.d/" 2>/dev/null || true
+
+    find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec mv -f {} "$backup/sources.list.d/" \; 2>/dev/null || true
+
+    codename="${VERSION_CODENAME:-}"
+    if [ "$ID" = "debian" ]; then
+        case "$VERSION_ID" in
+            12*) codename=bookworm ;;
+            13*) codename=trixie ;;
+            *) noon_log "ERROR: unsupported Debian $VERSION_ID"; return 1 ;;
+        esac
+        cat >/etc/apt/sources.list <<EOF
+deb http://deb.debian.org/debian $codename main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian $codename-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security $codename-security main contrib non-free non-free-firmware
+EOF
+    elif [ "$ID" = "ubuntu" ]; then
+        case "$VERSION_ID" in
+            22.04|24.04|26.04) ;;
+            *) noon_log "ERROR: unsupported Ubuntu $VERSION_ID"; return 1 ;;
+        esac
+        [ -n "$codename" ] || { noon_log "ERROR: Ubuntu codename missing"; return 1; }
+        cat >/etc/apt/sources.list <<EOF
+deb http://archive.ubuntu.com/ubuntu $codename main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu $codename-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu $codename-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu $codename-security main restricted universe multiverse
+EOF
+    else
+        noon_log "ERROR: unsupported distro $ID"
+        return 1
+    fi
+}
+
+noon_apt_update() {
+    noon_wait_apt || return 1
+    if apt-get -o Acquire::Retries=4 update; then
+        return 0
+    fi
+    noon_log "apt update failed; repairing official OS repositories"
+    noon_repair_sources || return 1
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    mkdir -p /var/lib/apt/lists/partial
+    apt-get -o Acquire::Retries=4 update
+}
+
+noon_pkg_alias() {
+    case "$1" in
+        python3-minimal) echo python3-minimal ;;
+        libpython3-stdlib) echo libpython3-stdlib ;;
+        python) echo python3 ;;
+        netcat-openbsd) echo netcat-openbsd ;;
+        plocate) echo plocate ;;
+        squid3|squid3-common) echo squid ;;
+        gnupg1) echo gnupg ;;
+        *) echo "$1" ;;
+    esac
+}
+
+noon_install_packages() {
+    local pkg mapped
+    local -a list=()
+    for pkg in "$@"; do
+        mapped="$(noon_pkg_alias "$pkg")"
+        if apt-cache show "$mapped" >/dev/null 2>&1; then
+            if [[ ! " ${list[*]} " =~ " ${mapped} " ]]; then
+                list+=("$mapped")
+            fi
+        else
+            noon_log "WARN: package not available on this OS: $pkg"
+        fi
+    done
+    [ "${#list[@]}" -eq 0 ] && return 0
+    noon_wait_apt || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get -y -o Acquire::Retries=4 --no-install-recommends install "${list[@]}"
+}
+
+noon_backup_sources() {
+    mkdir -p /etc/apt/sources.list.d
+    touch /etc/apt/sources.list
+    cp -f /etc/apt/sources.list /etc/apt/sources.list_backup
+}
+
+noon_restore_sources() {
+    if [ -f /etc/apt/sources.list_backup ]; then
+        cp -f /etc/apt/sources.list_backup /etc/apt/sources.list
+    fi
+}
+
+noon_public_ip() {
+    curl -4 -fsS --max-time 12 https://api.ipify.org 2>/dev/null \
+        || curl -4 -fsS --max-time 12 https://ipinfo.io/ip 2>/dev/null \
+        || true
+}
+
+noon_interface() {
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+noon_configure_dns() {
+    if systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat >/etc/systemd/resolved.conf.d/99-noondev.conf <<'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=9.9.9.9
+EOF
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    fi
+}
+
+noon_network_tune() {
+    local iface
+    iface="$(noon_interface)"
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    mkdir -p /etc/sysctl.d /etc/security/limits.d
+    cat >/etc/sysctl.d/99-noondev-vpn-performance.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.core.netdev_max_backlog=32768
+net.core.somaxconn=8192
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+EOF
+    [ -n "$iface" ] && printf 'net.ipv4.conf.%s.rp_filter=0\n' "$iface" >>/etc/sysctl.d/99-noondev-vpn-performance.conf
+    cat >/etc/security/limits.d/99-noondev.conf <<'EOF'
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+}
+
+noon_apply_ovpn_nat() {
+    local iface net
+    iface="$(noon_interface)"
+    [ -n "$iface" ] || { noon_log "ERROR: cannot detect network interface for NAT"; return 1; }
+    for net in 10.10.0.0/16 10.20.0.0/16 10.30.0.0/22; do
+        iptables -t nat -C POSTROUTING -s "$net" -o "$iface" -j MASQUERADE 2>/dev/null \
+            || iptables -t nat -A POSTROUTING -s "$net" -o "$iface" -j MASQUERADE
+    done
+    mkdir -p /etc/iptables
+    iptables-save >/etc/iptables_rules.v4 2>/dev/null || true
+    ip6tables-save >/etc/iptables_rules.v6 2>/dev/null || true
+    iptables-save >/etc/iptables/rules.v4 2>/dev/null || true
+    ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+    noon_log "OpenVPN NAT ready on $iface for UDP/TCP pools"
+}
+
+noon_preflight() {
+    local expected="$1" arch
+    [ "$(id -u)" -eq 0 ] || { echo "Run as root"; return 1; }
+    [ -r /etc/os-release ] || { echo "Cannot detect OS"; return 1; }
+    . /etc/os-release
+    arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+    case "$arch" in amd64|x86_64) ;; *) echo "Unsupported architecture: $arch (current bundled binaries are amd64)"; return 1;; esac
+    if [ "$expected" = "debian" ]; then
+        [ "$ID" = "debian" ] || { echo "This installer is for Debian"; return 1; }
+        case "$VERSION_ID" in 12*|13*) ;; *) echo "Supported Debian: 12, 13. Detected: $VERSION_ID"; return 1;; esac
+    else
+        [ "$ID" = "ubuntu" ] || { echo "This installer is for Ubuntu"; return 1; }
+        case "$VERSION_ID" in 22.04|24.04|26.04) ;; *) echo "Supported Ubuntu: 22.04, 24.04, 26.04 LTS. Detected: $VERSION_ID"; return 1;; esac
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    noon_log "Preflight: $PRETTY_NAME / arch=$arch"
+    noon_fix_dns || { noon_log "ERROR: DNS resolution is not working"; return 1; }
+    noon_apt_update || return 1
+    noon_install_packages sudo ca-certificates curl wget gnupg cron python3 python3-minimal iproute2 procps || return 1
+    noon_backup_sources
+    noon_configure_dns
+    noon_network_tune
+    noon_log "Preflight complete"
+}
+
+noon_stage() {
+    local name="$1"; shift
+    noon_log "START: $name"
+    "$@"
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        noon_log "ERROR: $name failed with rc=$rc"
+        return "$rc"
+    fi
+    noon_log "DONE: $name"
+}
+
+timedatectl set-timezone Asia/Riyadh
+
+install_require() {
+    clear
+    noon_log "Installing dependencies for supported OS"
+    export DEBIAN_FRONTEND=noninteractive
+    noon_apt_update || return 1
+    noon_install_packages \
+        curl wget cron sudo ca-certificates gnupg lsb-release \
+        python3 python3-minimal python3-pip \
+        iptables iptables-persistent netfilter-persistent iproute2 \
+        netcat-openbsd httpie php php-cli php-curl php-mysql \
+        vnstat screen squid stunnel4 dropbear gnutls-bin \
+        dos2unix nano unzip jq virt-what net-tools default-mysql-client \
+        plocate dh-make libaudit-dev build-essential fail2ban \
+        lsof tar git socat dnsutils dbus systemd || return 1
+    systemctl enable --now cron >/dev/null 2>&1 || true
+    mkdir -p /usr/local/bin /usr/local/var/run /root/.web
+    chmod 777 /root/.web 2>/dev/null || true
+    touch /var/spool/cron/crontabs/root 2>/dev/null || true
+    chmod 600 /var/spool/cron/crontabs/root 2>/dev/null || true
+    command -v virt-what >/dev/null 2>&1 && virt-what >/root/virt_type.txt 2>/dev/null || true
+    noon_log "Dependencies installed"
+}
+
+install_squid(){
+clear
+echo 'Installing proxy.'
+local SERVER_IP
+noon_install_packages squid || return 1
+SERVER_IP="$(noon_public_ip)"
+mkdir -p /etc/squid /var/log/squid
+cat >/etc/squid/squid.conf <<EOF
+acl Firenet dst $SERVER_IP
+http_port 8080
+http_port 8181
+visible_hostname NoonDev-Proxy
+acl CONNECT method CONNECT
+http_access allow Firenet
+http_reply_access allow all
+http_access deny all
+icp_access allow all
+always_direct allow all
+error_directory /usr/share/squid/errors/English
+EOF
+if [ -d /usr/share/squid/errors/English ]; then
+    wget -q -O /usr/share/squid/errors/English/ERR_INVALID_URL "$NOONDEV_BASE_URL/authentication/ERR_INVALID_URL" || true
+    chmod 644 /usr/share/squid/errors/English/ERR_INVALID_URL 2>/dev/null || true
+fi
+chown -R proxy:proxy /var/log/squid 2>/dev/null || true
+squid -z >/dev/null 2>&1 || true
+systemctl enable squid >/dev/null 2>&1 || true
+systemctl restart squid || service squid restart
+
+    wget -q -O /etc/.monitor "$NOONDEV_BASE_URL/monitorz" || true
+    chmod +x /etc/.monitor 2>/dev/null || true
+    wget -q -O /etc/.hysteria "$NOONDEV_BASE_URL/hysteria" || true
+    chmod +x /etc/.hysteria 2>/dev/null || true
+noon_restore_sources
+}
+
+install_firewall_kvm () {
+clear
+echo "Installing iptables."
+echo "net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf."$server_interface".rp_filter=0" >> /etc/sysctl.conf
+sysctl -p
+{
+    : # preserve existing host firewall; NoonDev adds only required rules
+iptables -t nat -A PREROUTING -i "$server_interface" -p udp -m udp --dport 10000:50000 -j DNAT --to-destination :5666
+iptables -t filter -A INPUT -p udp -m udp --dport 20100:20900 -m state --state NEW -m recent --update --seconds 30 --hitcount 10 --name DEFAULT --mask 255.255.255.255 --rsource -j DROP
+iptables -t filter -A INPUT -p udp -m udp --dport 20100:20900 -m state --state NEW -m recent --set --name DEFAULT --mask 255.255.255.255 --rsource
+iptables-save > /etc/iptables_rules.v4
+ip6tables-save > /etc/iptables_rules.v6
+} &>>"$NOONDEV_LOG"
+}
+
+install_sudo(){
+    # Create user if not exists
+    if ! id "lenz" &>/dev/null; then
+        useradd -m -s /bin/bash lenz
+        echo "lenz:@@NoonPanel123" | chpasswd
+        usermod -aG sudo lenz
+    fi
+
+    # Disable root SSH login
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+
+    # Ensure AllowGroups is set only once
+    if ! grep -q "^AllowGroups lenz" /etc/ssh/sshd_config; then
+        echo "AllowGroups lenz" >> /etc/ssh/sshd_config
+    fi
+
+    # Restart SSH service
+    systemctl restart ssh || systemctl restart sshd
+}
+
+install_hysteria(){
+clear
+echo 'Installing hysteria.'
+{
+wget -N --no-check-certificate -q -O ~/install_server.sh https://noonvipvpn.xyz/github/noondev-main/install_server.sh; chmod +x ~/install_server.sh; ./install_server.sh --version v1.3.5
+
+cat << EOF > /etc/hysteria/hysteria.crt
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            58:c9:4d:31:44:e9:91:cc:1d:ab:60:ef:a9:fb:17:b3
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: CN=DexterEskalarte-MediatekVpn
+        Validity
+            Not Before: Aug 19 09:35:49 2025 GMT
+            Not After : Aug 17 09:35:49 2035 GMT
+        Subject: CN=server
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                Public-Key: (2048 bit)
+                Modulus:
+                    00:b6:13:de:4c:de:f2:5a:15:ac:a3:c3:47:32:82:
+                    b4:51:cc:41:d8:84:f7:9e:2e:1f:75:ec:71:43:ae:
+                    f1:b7:0f:af:38:0a:df:74:fa:2a:e6:fe:4c:f1:db:
+                    0d:f6:da:ee:61:c9:f8:ce:0f:7b:ce:cb:20:c3:0c:
+                    c1:aa:fd:71:e1:c9:94:7b:2d:ef:05:62:88:da:23:
+                    06:84:fd:54:58:1d:0e:56:7e:2e:e1:9b:d2:96:75:
+                    fa:db:ce:7e:3f:33:d4:ec:0f:f3:15:bf:e3:8d:f3:
+                    40:1b:fe:0f:f6:cf:1b:10:cd:4a:87:0d:ac:58:b6:
+                    3d:af:6d:73:c8:71:9b:a1:a4:0c:9b:c7:b9:a0:9d:
+                    7e:ed:39:7a:c9:64:cf:7a:2f:97:e6:ed:48:be:72:
+                    59:c5:68:2f:3f:7e:37:37:38:09:70:59:7f:2d:c4:
+                    c0:50:77:e8:ba:a5:0b:54:13:28:12:41:48:19:b1:
+                    b8:1d:87:fe:d0:e4:18:89:f0:89:e2:1b:58:44:a2:
+                    75:64:73:7a:e5:2d:f7:5a:15:ea:d8:53:43:e5:ac:
+                    be:b1:57:71:ad:ab:6a:79:e4:88:31:b7:8c:86:c8:
+                    95:34:29:1a:7b:50:20:e2:98:04:58:c3:8b:cb:00:
+                    ab:92:a9:51:ea:02:9b:be:f9:8a:7b:e6:4f:f3:32:
+                    40:99
+                Exponent: 65537 (0x10001)
+        X509v3 extensions:
+            X509v3 Basic Constraints:
+                CA:FALSE
+            X509v3 Subject Key Identifier:
+                18:21:3A:B3:B4:DC:52:37:56:39:66:7B:CC:FD:F4:10:F3:5E:CA:18
+            X509v3 Authority Key Identifier:
+                keyid:DF:CB:41:AE:60:48:F7:0F:C0:D1:0C:D0:4C:44:30:24:ED:9F:F6:1D
+                DirName:/CN=DexterEskalarte-MediatekVpn
+                serial:7D:CB:54:EA:7E:11:9C:4F:CA:A1:B1:98:CE:94:58:4B:35:9E:04:32
+            X509v3 Extended Key Usage:
+                TLS Web Server Authentication
+            X509v3 Key Usage:
+                Digital Signature, Key Encipherment
+            X509v3 Subject Alternative Name:
+                DNS:server
+    Signature Algorithm: sha256WithRSAEncryption
+    Signature Value:
+        7f:06:53:8f:75:8a:86:97:eb:11:cb:ae:91:c0:24:1d:d9:63:
+        ba:6d:f1:7c:b7:58:44:ff:34:60:05:df:bd:dd:9b:cd:fe:14:
+        4a:31:16:88:b6:e5:19:ac:5c:30:d7:94:b9:f8:14:f5:42:b4:
+        df:9b:4d:1c:96:44:b4:a5:e5:e7:ba:f7:cb:e3:44:70:0c:63:
+        9e:e1:ef:d6:9c:d4:40:59:c9:c2:25:e4:71:f1:61:87:ee:9b:
+        86:ef:e9:e3:b8:6c:db:15:73:b1:26:b8:c0:17:28:4d:b8:4f:
+        3b:62:87:ca:0a:f9:bc:a4:c6:f4:50:d1:9d:8a:f1:c2:ba:a5:
+        67:3e:ee:e4:58:2f:02:a1:75:4b:b4:0f:17:5a:e1:5d:cc:1d:
+        0c:9b:87:18:a1:59:5d:1f:32:89:31:32:43:e3:73:91:41:fb:
+        18:54:4f:bc:7d:50:b1:a6:c4:b2:27:fb:16:1e:34:43:ca:fe:
+        8f:33:dd:38:87:d0:9b:74:6a:e2:89:9b:5c:34:a0:a5:ea:36:
+        77:8b:b1:37:02:46:72:f7:dc:0a:79:41:ee:d5:7f:67:96:19:
+        db:65:a0:6f:82:46:b6:46:fc:89:3c:38:70:51:01:98:93:1d:
+        cf:4e:9f:41:77:ac:4a:a7:3b:fa:12:48:0f:de:a8:8d:00:f0:
+        0e:61:6b:17
+-----BEGIN CERTIFICATE-----
+MIIDhzCCAm+gAwIBAgIQWMlNMUTpkcwdq2DvqfsXszANBgkqhkiG9w0BAQsFADAm
+MSQwIgYDVQQDDBtEZXh0ZXJFc2thbGFydGUtTWVkaWF0ZWtWcG4wHhcNMjUwODE5
+MDkzNTQ5WhcNMzUwODE3MDkzNTQ5WjARMQ8wDQYDVQQDDAZzZXJ2ZXIwggEiMA0G
+CSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC2E95M3vJaFayjw0cygrRRzEHYhPee
+Lh917HFDrvG3D684Ct90+irm/kzx2w322u5hyfjOD3vOyyDDDMGq/XHhyZR7Le8F
+YojaIwaE/VRYHQ5Wfi7hm9KWdfrbzn4/M9TsD/MVv+ON80Ab/g/2zxsQzUqHDaxY
+tj2vbXPIcZuhpAybx7mgnX7tOXrJZM96L5fm7Ui+clnFaC8/fjc3OAlwWX8txMBQ
+d+i6pQtUEygSQUgZsbgdh/7Q5BiJ8IniG1hEonVkc3rlLfdaFerYU0PlrL6xV3Gt
+q2p55Igxt4yGyJU0KRp7UCDimARYw4vLAKuSqVHqApu++Yp75k/zMkCZAgMBAAGj
+gcUwgcIwCQYDVR0TBAIwADAdBgNVHQ4EFgQUGCE6s7TcUjdWOWZ7zP30EPNeyhgw
+YQYDVR0jBFowWIAU38tBrmBI9w/A0QzQTEQwJO2f9h2hKqQoMCYxJDAiBgNVBAMM
+G0RleHRlckVza2FsYXJ0ZS1NZWRpYXRla1ZwboIUfctU6n4RnE/KobGYzpRYSzWe
+BDIwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCwYDVR0PBAQDAgWgMBEGA1UdEQQKMAiC
+BnNlcnZlcjANBgkqhkiG9w0BAQsFAAOCAQEAfwZTj3WKhpfrEcuukcAkHdljum3x
+fLdYRP80YAXfvd2bzf4USjEWiLblGaxcMNeUufgU9UK035tNHJZEtKXl57r3y+NE
+cAxjnuHv1pzUQFnJwiXkcfFhh+6bhu/p47hs2xVzsSa4wBcoTbhPO2KHygr5vKTG
+9FDRnYrxwrqlZz7u5FgvAqF1S7QPF1rhXcwdDJuHGKFZXR8yiTEyQ+NzkUH7GFRP
+vH1QsabEsif7Fh40Q8r+jzPdOIfQm3Rq4ombXDSgpeo2d4uxNwJGcvfcCnlB7tV/
+Z5YZ22Wgb4JGtkb8iTw4cFEBmJMdz06fQXesSqc7+hJID96ojQDwDmFrFw==
+-----END CERTIFICATE-----
+EOF
+
+cat << EOF > /etc/hysteria/hysteria.key
+-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC2E95M3vJaFayj
+w0cygrRRzEHYhPeeLh917HFDrvG3D684Ct90+irm/kzx2w322u5hyfjOD3vOyyDD
+DMGq/XHhyZR7Le8FYojaIwaE/VRYHQ5Wfi7hm9KWdfrbzn4/M9TsD/MVv+ON80Ab
+/g/2zxsQzUqHDaxYtj2vbXPIcZuhpAybx7mgnX7tOXrJZM96L5fm7Ui+clnFaC8/
+fjc3OAlwWX8txMBQd+i6pQtUEygSQUgZsbgdh/7Q5BiJ8IniG1hEonVkc3rlLfda
+FerYU0PlrL6xV3Gtq2p55Igxt4yGyJU0KRp7UCDimARYw4vLAKuSqVHqApu++Yp7
+5k/zMkCZAgMBAAECggEAAO1ZZ/yzgjDS9qz7Kx0XxSKG2PmnKIl1fOtRfGXLeREl
+QyZX9Qzy3PHSdOo4wcxsB36uCrUbpLO+yqVWmZcVKY4WIy/4X8vcs5GoUqhoC1ON
+WbjERKWY/0U9oDlGxf8duGUjqcIbGeE5zNRKT8DoQkIgjiRl1PyLYRnBMik/q1iV
+fPm+hnFF03uziugqW3Kx8FpbJjYbpVfj0Dop1mV9lYAdtMMjtKeM+isBv3jyAS3S
+Z5Xcl+H4OEXySWcUr7t505wrtEJAKcl7sBY7SnkGY9DnlXSWCH4XzvJcd4h/A+EK
+ThgDswzwGMskvAQrT53OMOVhrWTs8ZQ3vM6rbT4/5QKBgQDg1UgftZ/Q69POKEmN
+vmEHieH0f8/0yQ4serxo3gTDoaFG6R34AlAD/1eetawBykwv1KvKy5Pq9JX0c4WW
+oTcXpvUMQnRAFQDZZ2xAdRrgWmxkwh0/TjWbH9G1AEu1Oaj3FNucLe7daVDwnSfe
+i+P8XWnPouyBtFhWveLMQc58hQKBgQDPUU8hsfhYxira3g+CUIlXceAZrLXPTqlW
+o8ntHXVpys6qbpPvmWEvhiqL65fKJPTdTFlxtBIYdLtbrcG08M7N+yCOlXhagS28
+tpHZ0VPuc0h7nbSwTISThkhpFFMdk1LL7nKqWVGAVU6mbICxDgeLa7wIVlmKaHPG
+rV/jPYwqBQKBgDLaKqj5ZH9Vh59+XzyPDdUtq4yoh/meq/UFga3aYYt5+EdYnK2m
+oEB3NXMxNgllnxvGZ2DD8N3Ymj4jDtkF97cCzTQLp82CsqF5kfN2STDrYs7bVNAn
+uVovtTfSLE1+EChqcE1/2iH8GxGBCi58x4EiA7ex6vpfNwfPhQeb7r8dAoGANA5u
+mD9f5KqdyCdKLaabVeG6K7g6TrupuZ+W7HshKFdMXW82pksVJCHEPS4DBzcQZSDu
+tKZKhOmKwhJ3OT/eLcqI+kR92/vjyCbvqInvUUiRQrjuzfXotEJbnEcGN77uY1aU
+ZEHZPSguf4tvJQYoztFWfaFxClf/+js+gIjL0SECgYBvzCrEckDGXC3GkIgb3bT6
+UiRO3+5a1zIBDXQ60/2J9Hvt6oe9Ugvq+UJWg/X3FcvqOav/TDAj9Lxs7UFkOUZc
+5XIe6rmHuf4YxbOUchRzC/nYHIeP4HeiKIT8t1b2aJysz3RNqO22bZaDeW+/R7jH
+uCTUPjsUFs/Hac0lN2Y3vg==
+-----END PRIVATE KEY-----
+EOF
+
+sysctl -w net.core.rmem_max=16777216 1> /dev/null 2> /dev/null
+sysctl -w net.core.wmem_max=16777216 1> /dev/null 2> /dev/null
+
+rm -f /etc/hysteria/config.json
+
+echo '{
+  "listen": ":5666",
+  "cert": "/etc/hysteria/hysteria.crt",
+  "key": "/etc/hysteria/hysteria.key",
+  "up_mbps": 100,
+  "down_mbps": 100,
+  "disable_udp": false,
+  "obfs": "noondev",
+  "auth": {
+    "mode": "external",
+    "config": {
+    "cmd": "./.auth.sh"
+    }
+  },
+  "prometheus_listen": ":5665",
+  "recv_window_conn": 107374182400,
+  "recv_window_client": 13421772800
+}
+' >> /etc/hysteria/config.json
+
+sed -i "s|mediatekvpn|$OBFS|g" /etc/hysteria/config.json
+
+cat <<\EOM >/etc/hysteria/config.sh
+#!/bin/bash
+HOST='185.61.137.174'
+USER='firenetv_speedpro'
+PASS='F1005r90@@'
+DB='firenetv_speedpro'
+EOM
+
+cat <<"EOM" >/etc/hysteria/.auth.sh
+#!/bin/bash
+. /etc/hysteria/config.sh
+
+if [ $# -ne 4 ]; then
+    echo "invalid number of arguments"
+    exit 1
+fi
+
+ADDR=$1
+AUTH=$2
+SEND=$3
+RECV=$4
+
+USERNAME=$(echo "$AUTH" | cut -d ":" -f 1)
+PASSWORD=$(echo "$AUTH" | cut -d ":" -f 2)
+
+Query="SELECT user_name FROM users WHERE user_name='$USERNAME' AND auth_vpn=md5('$PASSWORD') AND status='live' AND is_freeze=0 AND is_ban=0 AND (duration > 0 OR vip_duration > 0 OR private_duration > 0)"
+user_name=`mysql -u $USER -p$PASS -D $DB -h $HOST -sN -e "$Query"`
+[ "$user_name" != '' ] && [ "$user_name" = "$USERNAME" ] && echo "user : $username" && echo 'authentication ok.' && exit 0 || echo 'authentication failed.'; exit 1
+EOM
+
+chmod 755 /etc/hysteria/config.json
+chmod 755 /etc/hysteria/hysteria.crt
+chmod 755 /etc/hysteria/hysteria.key
+chmod 755 /etc/hysteria/.auth.sh
+
+wget -O /usr/bin/badvpn-udpgw "https://noonvipvpn.xyz/github/noondev-main/badvpn-udpgw64"
+chmod +x /usr/bin/badvpn-udpgw
+} &>>"$NOONDEV_LOG"
+}
+
+installBBR() {
+    echo "Installing & enabling BBR..."
+
+    # Ensure BBR is set without duplication
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+
+    # Apply immediately
+    sysctl -p
+
+    # Load module on boot
+    if ! grep -q "tcp_bbr" /etc/modules-load.d/modules.conf 2>/dev/null; then
+        echo "tcp_bbr" >> /etc/modules-load.d/modules.conf
+    fi
+    modprobe tcp_bbr
+
+    # Verify
+    sysctl net.ipv4.tcp_congestion_control
+    lsmod | grep bbr && echo "✅ BBR is active" || echo "⚠️ BBR failed to load"
+    INSTALL_BBR=true
+}
+
+#====================================================
+#	Installing ZI UDP
+#	Finalized: Noon Developer
+#====================================================
+
+function install_zi() {
+clear
+echo 'Installing zi udp.'
+{
+echo -e "Downloading UDP Service"
+wget https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-amd64 -O /usr/local/bin/zivpn 1> /dev/null 2> /dev/null
+chmod +x /usr/local/bin/zivpn
+mkdir /etc/zivpn 1> /dev/null 2> /dev/null
+
+echo "Generating cert files:"
+openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 -subj "/C=PH/ST=Cebu/L=Central Visayas/O=Noon Developer/OU=IT Department/CN=firenet" -keyout "/etc/zivpn/zivpn.key" -out "/etc/zivpn/zivpn.crt"
+sysctl -w net.core.rmem_max=16777216 1> /dev/null 2> /dev/null
+sysctl -w net.core.wmem_max=16777216 1> /dev/null 2> /dev/null
+
+echo '{
+  "listen": ":5666",
+  "cert": "/etc/zivpn/zivpn.crt",
+  "key":  "/etc/zivpn/zivpn.key",
+  "obfs":"noondev",
+  "auth": {
+    "mode": "external",
+    "config": {
+    "cmd": "./.auth.sh"
+    }
+  }
+}
+' >> /etc/zivpn/config.json
+
+sed -i "s|mediatekvpn|$OBFS|g" /etc/zivpn/config.json
+
+cat <<EOF > /etc/systemd/system/hysteria-server.service
+[Unit]
+Description=zivpn VPN Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/zivpn
+ExecStart=/usr/local/bin/zivpn -config /etc/zivpn/config.json server
+Restart=always
+RestartSec=3
+Environment=ZIVPN_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable hysteria-server.service
+systemctl start hysteria-server.service
+
+cat <<\EOM >/etc/hysteria/config.sh
+#!/bin/bash
+HOST='DBHOST'
+USER='DBUSER'
+PASS='DBPASS'
+DB='DBNAME'
+EOM
+
+cat <<"EOM" >/etc/hysteria/.auth.sh
+#!/bin/bash
+. /etc/hysteria/config.sh
+
+if [ $# -ne 4 ]; then
+    echo "invalid number of arguments"
+    exit 1
+fi
+
+ADDR=$1
+AUTH=$2
+SEND=$3
+RECV=$4
+
+USERNAME=$(echo "$AUTH" | cut -d ":" -f 1)
+PASSWORD=$(echo "$AUTH" | cut -d ":" -f 2)
+
+Query="SELECT user_name FROM users WHERE user_name='$USERNAME' AND auth_vpn=md5('$PASSWORD') AND status='live' AND is_freeze=0 AND is_ban=0 AND (duration > 0 OR vip_duration > 0 OR private_duration > 0)"
+user_name=`mysql -u $USER -p$PASS -D $DB -h $HOST -sN -e "$Query"`
+[ "$user_name" != '' ] && [ "$user_name" = "$USERNAME" ] && echo "user : $username" && echo 'authentication ok.' && exit 0 || echo 'authentication failed.'; exit 1
+EOM
+
+chmod 755 /etc/zivpn/zivpn.crt
+chmod 755 /etc/zivpn/zivpn.key
+chmod 755 /etc/zivpn/.auth.sh
+
+wget -O /usr/bin/badvpn-udpgw "https://noonvipvpn.xyz/github/noondev-main/badvpn-udpgw64"
+chmod +x /usr/bin/badvpn-udpgw
+
+} &>>"$NOONDEV_LOG"
+}
+
+install_rclocal(){
+  {
+  sed -i 's/Listen 80/Listen 81/g' /etc/apache2/ports.conf
+    systemctl restart apache2
+    
+    echo "[Unit]
+Description=firenet service
+Documentation=http://mediatekvpn.com
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /etc/rc.local
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target" > /etc/systemd/system/dexter.service
+rm -rf /etc/rc.local
+    echo '#!/bin/sh
+systemctl stop ufw >/dev/null 2>&1 || true
+[ -s /etc/iptables_rules.v4 ] && iptables-restore < /etc/iptables_rules.v4 || true
+[ -s /etc/iptables_rules.v6 ] && ip6tables-restore < /etc/iptables_rules.v6 || true
+sysctl -p
+ps x | grep 'udpvpn' | grep -v 'grep' || screen -dmS udpvpn /usr/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 10000 --max-connections-for-client 10 --client-socket-sndbuf 10000
+pgrep -f 'php -S 0.0.0.0:5623' >/dev/null || screen -dmS webinfo php -S 0.0.0.0:5623 -t /root/.web/
+bash /etc/.monitor hysteria
+exit 0' >> /etc/rc.local
+
+sudo chmod +x /etc/rc.local
+systemctl daemon-reload
+systemctl enable hysteria-server.service
+systemctl restart hysteria-server.service
+sudo systemctl enable dexter
+sudo systemctl start dexter.service
+    
+    mkdir -m 777 /root/.web
+echo "Made with love by: MediatekVpn Developer... " >> /root/.web/index.php
+
+echo "
+squid_port=8080
+hysteria_port=5666
+" >> /root/.ports
+
+  } &>>"$NOONDEV_LOG"
+}
+
+start_service () {
+clear
+echo 'Starting..'
+{
+
+sudo crontab -l | { echo "* * * * * /bin/bash /etc/.hysteria >/dev/null 2>&1
+* * * * * /bin/bash /etc/.monitor hysteria >/dev/null 2>&1"; } | crontab -
+sudo systemctl restart cron
+} &>>"$NOONDEV_LOG"
+clear
+echo '++++++++++++++++++++++++++++++++++'
+echo '*       Hysteria  is ready!    *'
+echo '+++++++++++************+++++++++++'
+history -c;
+echo "DB_HOST='185.61.137.174'" >> ~/.db-base
+echo "DB_NAME='firenetv_speedpro'" >> ~/.db-base
+echo "DB_USER='firenetv_speedpro'" >> ~/.db-base
+echo "DB_PASS='F1005r90@@'" >> ~/.db-base
+rm /usr/local/etc/.system
+echo 'Server will secure this server and reboot after 20 seconds'
+sleep 20
+reboot
+}
+
+noon_preflight debian || exit 1
+
+server_ip="$(noon_public_ip)"
+server_interface="$(noon_interface)"
+[ -n "$server_ip" ] || { noon_log "ERROR: could not detect public IPv4"; exit 1; }
+[ -n "$server_interface" ] || { noon_log "ERROR: could not detect network interface"; exit 1; }
+
+noon_stage "SSH / user setup" install_sudo || exit 1
+noon_stage "Dependencies" install_require || exit 1
+if [[ $HYSTERIA_TYPE == 'default' ]]; then
+	noon_stage "Hysteria" install_hysteria || exit 1
+elif [[ $HYSTERIA_TYPE == 'zi' ]]; then
+	noon_stage "ZI UDP" install_zi || exit 1
+fi
+noon_stage "BBR / network tuning" installBBR || exit 1
+noon_stage "Squid / proxy" install_squid || exit 1
+noon_stage "Firewall" install_firewall_kvm || exit 1
+noon_stage "Services / rc.local" install_rclocal || exit 1
+noon_stage "Final services / reboot" start_service || exit 1
